@@ -1,0 +1,134 @@
+# tools/query_history_tool.py
+from google.cloud import bigquery
+
+bq = bigquery.Client()
+
+def load_query_history(days: int = 30) -> list:
+    """
+    Loads BigQuery query jobs from the last N days.
+    """
+    query = f"""
+    SELECT
+      job_id,
+      query,
+      total_bytes_processed,
+      total_bytes_billed,
+      total_slot_ms,
+      TIMESTAMP_DIFF(end_time, start_time, MILLISECOND) AS duration_ms,
+      user_email,
+      creation_time
+    FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+    WHERE job_type = 'QUERY'
+      AND state = 'DONE'
+      AND query IS NOT NULL
+      AND creation_time >= TIMESTAMP_SUB(
+            CURRENT_TIMESTAMP(), INTERVAL {days} DAY
+          )
+    """
+    return [dict(r) for r in bq.query(query).result()]
+
+
+# tools/feature_extractor_tool.py
+def extract_features(job: dict) -> dict:
+    """
+    Converts raw job metadata into analytical features.
+    """
+    return {
+        "job_id": job["job_id"],
+        "query": job["query"],
+        "bytes_processed_gb": round(job["total_bytes_processed"] / (1024**3), 2),
+        "bytes_billed_gb": round(job["total_bytes_billed"] / (1024**3), 2),
+        "duration_sec": round(job["duration_ms"] / 1000, 2),
+        "slot_ms": job["total_slot_ms"],
+        "user": job["user_email"]
+    }
+# tools/heuristic_tool.py
+def heuristic_score(features: dict) -> dict:
+    score = 0
+    reasons = []
+
+    if features["bytes_processed_gb"] > 10:
+        score += 40
+        reasons.append("High bytes processed")
+
+    if features["duration_sec"] < 5 and features["bytes_processed_gb"] > 5:
+        score += 20
+        reasons.append("Large scan for short execution")
+
+    if features["slot_ms"] > 10000:
+        score += 20
+        reasons.append("High slot consumption")
+
+    return {
+        "score": score,
+        "reasons": reasons
+    }
+# agent/inefficiency_agent.py
+from google.adk.agents import Agent
+from google.adk.models import Gemini
+from tools.query_history_tool import load_query_history
+from tools.feature_extractor_tool import extract_features
+from tools.heuristic_tool import heuristic_score
+
+model = Gemini(model="gemini-2.5-flash")
+
+SYSTEM_INSTRUCTIONS = """
+You are a BigQuery efficiency analysis agent.
+
+Your task:
+- Analyze query execution metrics
+- Identify inefficient queries
+- DO NOT optimize queries
+- DO NOT suggest improvements
+- DO NOT rewrite SQL
+
+Classify inefficiency based on bytes processed, duration, and slot usage.
+
+Output JSON only.
+"""
+
+inefficiency_agent = Agent(
+    name="bq_inefficiency_agent",
+    model=model,
+    instruction=SYSTEM_INSTRUCTIONS,
+    tools=[
+        load_query_history,
+        extract_features,
+        heuristic_score
+    ]
+)
+# run_step1.py
+def run_step1(days=30):
+    jobs = load_query_history(days)
+    inefficient = []
+
+    for job in jobs:
+        features = extract_features(job)
+        heuristic = heuristic_score(features)
+
+        # LLM judgment only if heuristics indicate risk
+        if heuristic["score"] >= 40:
+            prompt = f"""
+Metrics:
+{features}
+
+Heuristic score:
+{heuristic}
+
+Is this query inefficient?
+Respond in JSON:
+{{"inefficient": true/false, "reason": "..."}}
+"""
+            response = inefficiency_agent.run(prompt)
+
+            if response["inefficient"]:
+                inefficient.append({
+                    "job_id": features["job_id"],
+                    "query": features["query"],
+                    "inefficiency_score": min(
+                        heuristic["score"] + 30, 100
+                    ),
+                    "reasons": heuristic["reasons"] + [response["reason"]]
+                })
+
+    return inefficient
