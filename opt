@@ -1,0 +1,120 @@
+# tools/dry_run_tool.py
+from google.cloud import bigquery
+
+bq = bigquery.Client()
+
+def dry_run(sql: str) -> dict:
+    job = bq.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(
+            dry_run=True,
+            use_query_cache=False
+        )
+    )
+    return {
+        "bytes_processed": job.total_bytes_processed
+    }
+# tools/syntax_guard_tool.py
+FORBIDDEN_KEYWORDS = {
+    "join", "with", "unnest",
+    "partition", "cluster"
+}
+
+def syntax_guard(original_sql: str, optimized_sql: str) -> dict:
+    o = set(original_sql.lower().split())
+    n = set(optimized_sql.lower().split())
+
+    violations = list((n - o) & FORBIDDEN_KEYWORDS)
+
+    return {
+        "safe": len(violations) == 0,
+        "violations": violations
+    }
+# agent/syntax_optimizer_agent.py
+from google.adk.agents import Agent
+from google.adk.models import Gemini
+from tools.dry_run_tool import dry_run
+from tools.syntax_guard_tool import syntax_guard
+
+model = Gemini(model="gemini-2.5-flash")
+
+syntax_optimizer_agent = Agent(
+    name="bq_syntax_optimizer",
+    model=model,
+    instruction="""
+You are a BigQuery SQL syntactical optimization agent.
+
+ABSOLUTE RULES:
+- ONLY syntactical changes
+- NO join changes
+- NO CTE or subquery restructuring
+- NO partition or clustering recommendations
+- NO logic changes
+
+ALLOWED:
+- Remove SELECT *
+- Narrow column lists
+- Rewrite DATE filters
+- Remove redundant CASTs
+- Normalize literals
+- Remove redundant predicates
+
+Output format (JSON):
+{
+  "optimized_sql": "...",
+  "changes": ["change1", "change2"]
+}
+""",
+    tools=[dry_run, syntax_guard]
+)
+# runner_step2.py
+from google.adk.runners import Runner
+from agent.syntax_optimizer_agent import syntax_optimizer_agent
+
+syntax_runner = Runner(agent=syntax_optimizer_agent)
+# run_step2.py
+from runner_step2 import syntax_runner
+from tools.dry_run_tool import dry_run
+from tools.syntax_guard_tool import syntax_guard
+
+def run_step2(inefficient_queries: list):
+    results = []
+
+    for q in inefficient_queries:
+        original_sql = q["query"]
+
+        # 1️⃣ Dry run original
+        before = dry_run(original_sql)
+
+        # 2️⃣ Call ADK agent
+        result = syntax_runner.run(
+            input={
+                "sql": original_sql,
+                "inefficiency_context": q["reasons"]
+            }
+        )
+
+        optimized_sql = result.output["optimized_sql"]
+        changes = result.output["changes"]
+
+        # 3️⃣ Enforce syntax guard
+        guard = syntax_guard(original_sql, optimized_sql)
+        if not guard["safe"]:
+            continue  # discard unsafe output
+
+        # 4️⃣ Dry run optimized
+        after = dry_run(optimized_sql)
+
+        results.append({
+            "job_id": q["job_id"],
+            "original_bytes": before["bytes_processed"],
+            "optimized_bytes": after["bytes_processed"],
+            "reduction_pct": round(
+                (before["bytes_processed"] - after["bytes_processed"])
+                / before["bytes_processed"] * 100, 2
+            ),
+            "optimized_sql": optimized_sql,
+            "changes": changes
+        })
+
+    return results
