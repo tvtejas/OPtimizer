@@ -1,0 +1,119 @@
+# mcp/query_context.py
+from dataclasses import dataclass
+from typing import List, Optional, Dict
+
+@dataclass
+class QueryContext:
+    job_id: str
+    query: str
+
+    # Raw stats
+    bytes_processed: int
+    slot_ms: int
+
+    # Derived (tools)
+    sql_features: Optional[Dict[str, bool]] = None
+    historical_baseline_bytes: Optional[int] = None
+
+    # LLM outputs
+    inefficiency_score: Optional[float] = None
+    inefficiency_reasons: Optional[List[str]] = None
+# tools/sql_heuristic_tool.py
+import re
+
+def analyze_sql_features(sql: str) -> dict:
+    sql_l = sql.lower()
+
+    return {
+        "select_star": "select *" in sql_l,
+        "no_where": " where " not in sql_l,
+        "date_function_on_column": bool(re.search(r"date\s*\(", sql_l)),
+        "redundant_cast": "cast(" in sql_l,
+        "wildcard_table": "*" in re.findall(r"`[^`]*`", sql),
+    }
+# tools/query_baseline_tool.py
+from google.cloud import bigquery
+import hashlib
+
+bq = bigquery.Client()
+
+def fingerprint(sql: str) -> str:
+    return hashlib.md5(
+        re.sub(r"\s+", " ", sql.lower()).encode()
+    ).hexdigest()
+
+def get_baseline_bytes(sql: str) -> int | None:
+    fp = fingerprint(sql)
+
+    q = f"""
+    SELECT
+      APPROX_QUANTILES(total_bytes_processed, 10)[OFFSET(5)] AS median_bytes
+    FROM region-us.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+    WHERE query_hash = '{fp}'
+    """
+
+    rows = list(bq.query(q).result())
+    return rows[0].median_bytes if rows else None
+# tools/mcp_enricher.py
+from tools.sql_heuristic_tool import analyze_sql_features
+from tools.query_baseline_tool import get_baseline_bytes
+
+def enrich_context(ctx):
+    ctx.sql_features = analyze_sql_features(ctx.query)
+    ctx.historical_baseline_bytes = get_baseline_bytes(ctx.query)
+    return ctx
+# agents/inefficiency_agent.py
+from google.adk.agents import Agent
+from google.adk.models import Gemini
+
+model = Gemini(model="gemini-2.5-flash")
+
+inefficiency_agent = Agent(
+    name="bq_inefficiency_agent",
+    model=model,
+    instruction="""
+You are a BigQuery inefficiency detection agent.
+
+Input: QueryContext enriched with:
+- bytes_processed
+- sql_features
+- historical_baseline_bytes
+
+Your task:
+1. Assign inefficiency_score (0.0–1.0)
+2. List concrete inefficiency_reasons
+
+Rules:
+- Prefer tool signals over intuition
+- If bytes >> historical baseline, score high
+- Do NOT suggest optimizations
+"""
+)
+
+# runners/step1_runner.py
+from google.adk.runners import Runner
+from agents.inefficiency_agent import inefficiency_agent
+
+step1_runner = Runner(agent=inefficiency_agent)
+
+
+# step1.py
+from tools.mcp_enricher import enrich_context
+from runners.step1_runner import step1_runner
+
+def run_step1(contexts):
+    inefficient = []
+
+    for ctx in contexts:
+        # 1️⃣ Enrich MCP via tools
+        ctx = enrich_context(ctx)
+
+        # 2️⃣ LLM judgment
+        result = step1_runner.run(input=ctx)
+        updated_ctx = result.output
+
+        # 3️⃣ Threshold gate
+        if updated_ctx.inefficiency_score >= 0.7:
+            inefficient.append(updated_ctx)
+
+    return inefficient
