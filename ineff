@@ -132,3 +132,92 @@ Respond in JSON:
                 })
 
     return inefficient
+
+
+
+
+
+# agent/inefficiency_agent.py
+from google.adk.agents import Agent
+from google.adk.models import Gemini
+from tools.query_history_tool import load_query_history
+from tools.feature_extractor_tool import extract_features
+from tools.heuristic_tool import heuristic_score
+
+model = Gemini(model="gemini-2.5-flash")
+
+inefficiency_agent = Agent(
+    name="bq_inefficiency_agent",
+    model=model,
+    instruction="""
+You are a BigQuery efficiency analysis agent.
+
+Rules:
+- Analyze query execution metrics only
+- Identify inefficient queries
+- DO NOT rewrite SQL
+- DO NOT suggest optimizations
+- Output JSON only
+
+Return format:
+{
+  "inefficient": true|false,
+  "reason": "short explanation"
+}
+""",
+    tools=[
+        load_query_history,
+        extract_features,
+        heuristic_score
+    ]
+)
+
+
+
+# runner.py
+from google.adk.runners import Runner
+from agent.inefficiency_agent import inefficiency_agent
+
+runner = Runner(agent=inefficiency_agent)
+
+
+# run_step1.py
+from runner import runner
+from tools.query_history_tool import load_query_history
+from tools.feature_extractor_tool import extract_features
+from tools.heuristic_tool import heuristic_score
+
+def run_step1(days=30):
+    jobs = load_query_history(days)
+    inefficient_queries = []
+
+    for job in jobs:
+        features = extract_features(job)
+        heuristic = heuristic_score(features)
+
+        # Guardrail: only involve LLM if heuristic says "risky"
+        if heuristic["score"] < 40:
+            continue
+
+        prompt = {
+            "features": features,
+            "heuristic": heuristic
+        }
+
+        # ✅ CORRECT ADK CALL
+        result = runner.run(
+            input=prompt
+        )
+
+        # result.output contains model response
+        decision = result.output
+
+        if decision.get("inefficient") is True:
+            inefficient_queries.append({
+                "job_id": features["job_id"],
+                "query": features["query"],
+                "inefficiency_score": min(heuristic["score"] + 30, 100),
+                "reasons": heuristic["reasons"] + [decision["reason"]]
+            })
+
+    return inefficient_queries
