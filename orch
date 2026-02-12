@@ -1,0 +1,102 @@
+from langchain.tools import tool
+
+@tool
+def heuristic_tool(query: str) -> dict:
+    return run(query)   # your existing heuristic_agent.run
+from langchain.tools import tool
+
+@tool
+def llm_score_tool(query: str, metadata: dict) -> dict:
+    return run(query, metadata)
+from langchain.tools import tool
+
+@tool
+def validation_tool(query: str,
+                    heuristic: dict,
+                    llm_score: dict,
+                    metadata: dict) -> dict:
+    return run(query, heuristic, llm_score, metadata)
+import hashlib
+
+class QueryMemory:
+    def __init__(self):
+        self.store = {}
+
+    def _hash(self, query):
+        return hashlib.md5(query.encode()).hexdigest()
+
+    def exists(self, query):
+        return self._hash(query) in self.store
+
+    def get(self, query):
+        return self.store.get(self._hash(query))
+
+    def save(self, query, result):
+        self.store[self._hash(query)] = result
+from langchain.tools import tool
+
+memory = QueryMemory()
+
+@tool
+def memory_check_tool(query: str) -> dict:
+    if memory.exists(query):
+        return {"exists": True, "cached_result": memory.get(query)}
+    return {"exists": False}
+
+@tool
+def memory_save_tool(query: str, result: dict) -> str:
+    memory.save(query, result)
+    return "Saved"
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.agents import initialize_agent, AgentType
+from langchain.tools import Tool
+
+from agents.heuristic_agent import heuristic_tool
+from agents.llm_score_agent import llm_score_tool
+from agents.validation_agent import validation_tool
+from memory.query_memory import memory_check_tool, memory_save_tool
+
+
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0
+)
+
+tools = [
+    heuristic_tool,
+    llm_score_tool,
+    validation_tool,
+    memory_check_tool,
+    memory_save_tool
+]
+
+
+orchestrator_agent = initialize_agent(
+    tools=tools,
+    llm=llm,
+    agent=AgentType.OPENAI_FUNCTIONS,   # Gemini supports tool calling
+    verbose=True
+)
+def run_orchestrator(query: str, metadata: dict):
+
+    prompt = f"""
+You are the Stage-1 Orchestrator Agent.
+
+Workflow:
+1. Call memory_check_tool.
+2. If query exists → return cached result.
+3. Else:
+   - Call heuristic_tool
+   - Call llm_score_tool
+   - Call validation_tool
+4. Save final result using memory_save_tool.
+5. Return final verdict.
+
+Query:
+{query}
+
+Metadata:
+{metadata}
+"""
+
+    return orchestrator_agent.run(prompt)
